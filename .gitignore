@@ -1,0 +1,5 @@
+build/
+*.p12
+*.pem
+.DS_Store
+HANDOFF.md
