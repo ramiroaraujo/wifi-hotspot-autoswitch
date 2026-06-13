@@ -1,64 +1,38 @@
 #!/bin/bash
-# Build WifiAutoswitch.app — a minimal LSUIElement app bundle wrapping the Swift
-# binary so it can hold Location Services permission (the cure for the redaction
-# problem). Ad-hoc signed; that's enough for a local personal tool.
+# Build WifiAutoswitch.app via Xcode (project generated from project.yml by XcodeGen),
+# then sign it with the local self-signed identity so the Location Services grant —
+# keyed to the cert + bundle id — survives rebuilds.
 #
-# NOTE: a rebuild changes the ad-hoc code signature (cdhash), which revokes the
-# Location Services grant. You then re-enable "WifiAutoswitch" in
-# System Settings → Privacy & Security → Location Services. Config lives in
-# ~/Library/Application Support/wifi-hotspot-autoswitch/config.json so you rarely
-# need to rebuild.
+# The version comes from the latest git tag, so cutting a release is just:
+#   git tag v0.1.2 && ./build.sh
+#
+# Requires: Xcode, XcodeGen (brew install xcodegen). One-time: ./make-signing-cert.sh
 set -euo pipefail
-
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-APP="$ROOT/build/WifiAutoswitch.app"
-MACOS="$APP/Contents/MacOS"
-EXE="$MACOS/wifi-autoswitch"
-ID="com.ramiro.wifiautoswitch"
+cd "$ROOT"
 
-rm -rf "$APP"
-mkdir -p "$MACOS"
+VERSION="$(git describe --tags --match 'v*' --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
+VERSION="${VERSION:-0.0.0}"
+BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
-echo "Compiling…"
-swiftc -O -o "$EXE" "$ROOT/src/main.swift" \
-  -framework CoreWLAN -framework CoreLocation -framework Foundation \
-  -framework AppKit -framework ServiceManagement
+echo "Generating Xcode project…"
+xcodegen generate
 
-cat > "$APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleExecutable</key><string>wifi-autoswitch</string>
-  <key>CFBundleIdentifier</key><string>${ID}</string>
-  <key>CFBundleName</key><string>WifiAutoswitch</string>
-  <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.1</string>
-  <key>CFBundleVersion</key><string>2</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
-  <key>LSUIElement</key><true/>
-  <key>NSLocationUsageDescription</key><string>Read nearby Wi-Fi network names to switch between home Wi-Fi and the iPhone hotspot.</string>
-  <key>NSLocationWhenInUseUsageDescription</key><string>Read nearby Wi-Fi network names to switch between home Wi-Fi and the iPhone hotspot.</string>
-  <key>NSLocationAlwaysAndWhenInUseUsageDescription</key><string>Read nearby Wi-Fi network names in the background to switch between home Wi-Fi and the iPhone hotspot.</string>
-</dict>
-</plist>
-PLIST
+echo "Building $VERSION (build $BUILD)…"
+rm -rf build/dd build/WifiAutoswitch.app
+xcodebuild -project WifiAutoswitch.xcodeproj -scheme WifiAutoswitch -configuration Release \
+  -derivedDataPath build/dd \
+  MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD" \
+  CODE_SIGNING_ALLOWED=NO -quiet build
+ditto "build/dd/Build/Products/Release/WifiAutoswitch.app" build/WifiAutoswitch.app
 
-mkdir -p "$APP/Contents/Resources"
-cp "$ROOT/icon/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-
-# Prefer the stable self-signed identity (grant survives rebuilds); else ad-hoc.
+# Sign with the stable self-signed identity (preserves the Location grant); ad-hoc fallback.
 CERT_NAME="WifiAutoswitch Self-Signed"
 if security find-identity -p codesigning 2>/dev/null | grep -qF "$CERT_NAME"; then
-  SIGN="$CERT_NAME"
-  echo "Signing with stable identity: $CERT_NAME"
+  SIGN="$CERT_NAME"; echo "Signing with: $CERT_NAME"
 else
-  SIGN="-"
-  echo "Signing ad-hoc (no stable identity found — Location grant will reset each rebuild)"
+  SIGN="-"; echo "Signing ad-hoc (run ./make-signing-cert.sh for a stable identity)"
 fi
-codesign --force --identifier "$ID" --sign "$SIGN" "$EXE"
-codesign --force --identifier "$ID" --sign "$SIGN" "$APP"
-codesign --verify --verbose "$APP" 2>&1 | sed 's/^/  /' || true
-
-echo "Built: $APP"
+codesign --force --identifier com.ramiro.wifiautoswitch --sign "$SIGN" build/WifiAutoswitch.app
+codesign --verify --verbose build/WifiAutoswitch.app 2>&1 | sed 's/^/  /'
+echo "Built: $ROOT/build/WifiAutoswitch.app ($VERSION)"

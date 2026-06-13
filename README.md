@@ -29,13 +29,17 @@ A menu bar app satisfies both. That's why this is a real app, not a script.
 
 ## Build & install
 
-Requirements: macOS 14+, Xcode Command Line Tools (`swiftc`).
+Requirements: macOS 14+, Xcode, and [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+(`brew install xcodegen`). The Xcode project is generated from `project.yml` (no
+`.xcodeproj` to hand-maintain), and the app version comes from the latest git tag.
 
 ```bash
 ./make-signing-cert.sh   # once: stable self-signed identity so the Location
                          # grant survives rebuilds (ad-hoc signing would revoke it)
-./build.sh               # compiles + bundles + signs build/WifiAutoswitch.app
+./build.sh               # xcodegen generate → xcodebuild → sign → build/WifiAutoswitch.app
 ```
+
+To work in Xcode instead: `xcodegen generate && open WifiAutoswitch.xcodeproj`.
 
 Install and grant permission:
 
@@ -94,7 +98,7 @@ It only ever acts in the cases below — **a Wi-Fi network you picked yourself i
 `~/Library/Application Support/wifi-hotspot-autoswitch/`
 - `config.json` — written when you change settings in the menu (defaults are baked
   in, so it works out of the box). Editable by hand; restart the app to reload.
-- `state.json` — cooldown / quarantine bookkeeping.
+- `state.json` — cooldown / connectivity-backoff bookkeeping.
 - `scores.json` — time-decayed sighting score per SSID (7-day half-life) used to
   sort the menu pickers by recent familiarity (display only — never affects switching).
 - `switch.log` — decisions and switches.
@@ -105,10 +109,16 @@ Defaults: `minSignal -68`, `hysteresisGap 6`, `cooldown 45s`, `poll 30s`,
 ## Dev / debugging
 
 ```bash
-build/WifiAutoswitch.app/Contents/MacOS/wifi-autoswitch selftest   # pure decision-logic tests
-open -a build/WifiAutoswitch.app --args read                       # writes a JSON snapshot to last-read.json
+build/WifiAutoswitch.app/Contents/MacOS/WifiAutoswitch selftest   # pure decision-logic tests
+open -a build/WifiAutoswitch.app --args read                      # writes a JSON snapshot to last-read.json
 ```
 (Run `read` via `open`, not directly — a terminal child gets redacted names.)
+
+**Releasing:** `git tag v0.1.2 && ./build.sh` — the tag drives `CFBundleShortVersionString`
+(build number = commit count); no version is hand-edited.
+
+**App icon:** replace `icon/AppIcon-source.png` (1024²) and run `./icon/make-appiconset.sh`
+to regenerate the `Assets.xcassets` AppIcon set.
 
 Rebuilding keeps the Location grant because signing uses the stable
 `WifiAutoswitch Self-Signed` identity (Designated Requirement is identifier + cert,

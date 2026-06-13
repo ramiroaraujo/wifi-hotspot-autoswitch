@@ -1,4 +1,6 @@
 build/
+*.xcodeproj
+Support/
 *.p12
 *.pem
 .DS_Store
