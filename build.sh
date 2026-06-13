@@ -32,6 +32,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>wifi-autoswitch</string>
   <key>CFBundleIdentifier</key><string>${ID}</string>
   <key>CFBundleName</key><string>WifiAutoswitch</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
   <key>CFBundleVersion</key><string>1</string>
@@ -43,6 +44,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+mkdir -p "$APP/Contents/Resources"
+cp "$ROOT/icon/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 # Prefer the stable self-signed identity (grant survives rebuilds); else ad-hoc.
 CERT_NAME="WifiAutoswitch Self-Signed"
