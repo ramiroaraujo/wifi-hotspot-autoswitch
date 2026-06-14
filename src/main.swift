@@ -523,7 +523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         if let s = w.current?.ssid, s == config.hotspotSSID {
             return .symbol(
                 "antenna.radiowaves.left.and.right",
-                NSColor(calibratedRed: 27 / 255, green: 112 / 255, blue: 212 / 255, alpha: 1)
+                NSColor(srgbRed: 10 / 255, green: 132 / 255, blue: 255 / 255, alpha: 1)  // #0A84FF — system blue
             )
         }
         return .symbol("antenna.radiowaves.left.and.right", nil)
@@ -533,9 +533,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         guard let button = statusItem.button else { return }
         switch statusIcon() {
         case .symbol(let name, let tint):
-            let img = NSImage(systemSymbolName: name, accessibilityDescription: "WifiAutoswitch")
-            img?.isTemplate = true
-            button.contentTintColor = tint
+            var img = NSImage(systemSymbolName: name, accessibilityDescription: "WifiAutoswitch")
+            if let tint = tint {
+                // Bake the colour into a NON-template image. contentTintColor on a status
+                // item is unreliable, and a template image is forced monochrome (→ black/white).
+                img = img?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [tint]))
+                img?.isTemplate = false
+            } else {
+                img?.isTemplate = true   // adaptive monochrome, matches the menu bar
+            }
+            button.contentTintColor = nil
             button.image = img
         }
         button.toolTip = statusText()
