@@ -494,9 +494,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         work.asyncAfter(deadline: .now() + 2) { [weak self] in self?.runCycle() }
     }
 
-    // CWEventDelegate — fire a cycle immediately on Wi-Fi changes.
-    func ssidDidChangeForWiFiInterface(withName interfaceName: String) { work.async { [weak self] in self?.runCycle() } }
-    func linkDidChangeForWiFiInterface(withName interfaceName: String) { work.async { [weak self] in self?.runCycle() } }
+    // CWEventDelegate — refresh the icon instantly, then run a full cycle.
+    func ssidDidChangeForWiFiInterface(withName interfaceName: String) { refreshIconNow(); work.async { [weak self] in self?.runCycle() } }
+    func linkDidChangeForWiFiInterface(withName interfaceName: String) { refreshIconNow(); work.async { [weak self] in self?.runCycle() } }
+
+    /// Update just the menu-bar icon from the *current* network, skipping the blocking
+    /// multi-second `scanForNetworks` that `readWifi` runs. Wi-Fi events fire the moment a
+    /// connection changes, but the full cycle's scan (or an in-progress join) would otherwise
+    /// hold the icon stale for a few seconds — the current SSID/RSSI read here is instant.
+    func refreshIconNow() {
+        let status = loc.status
+        let client = CWWiFiClient.shared()
+        let iface = client.interface(withName: config.interface) ?? client.interface()
+        var cur: NetInfo? = nil
+        if let i = iface {
+            let s = i.ssid(); let r = i.rssiValue()
+            if s != nil || r != 0 { cur = NetInfo(ssid: s, bssid: i.bssid(), rssi: r, channel: nil, band: nil) }
+        }
+        let authorized = isAuthorized(status)
+        DispatchQueue.main.async {
+            if var w = self.lastWifi {
+                w.current = cur; w.authorized = authorized
+                if authorized { w.redacted = false } else if cur?.ssid == nil { w.redacted = true }
+                self.lastWifi = w
+            } else {
+                self.lastWifi = WifiState(interface: iface?.interfaceName, authStatus: authString(status),
+                                          authorized: authorized, redacted: !authorized && cur?.ssid == nil,
+                                          current: cur, scan: [], scanError: nil)
+            }
+            self.updateButton()
+        }
+    }
 
     @objc func systemDidWake() {
         loc.start()  // re-arm the location session after sleep
