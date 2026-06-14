@@ -60,6 +60,12 @@ Then open the menu and turn on **Launch at login**.
 - **Status line** — current network, signal, and internet check (`internet ✓/✗`).
 - **Auto-switch** — master on/off.
 - **Verify internet works** — enable the captive-portal / dead-internet probe.
+- **Wake idle hotspot (uses Accessibility)** — opt-in. An *idle* iPhone Personal Hotspot
+  isn't broadcasting Wi-Fi (it's advertised over Bluetooth/Continuity), so `networksetup`
+  can't join it. With this on, when a hotspot join fails because the phone is asleep, the
+  app wakes + joins it by pressing its row in the Control Center Wi-Fi menu for you — the
+  same thing you'd do by hand. Enabling it prompts for **Accessibility** permission
+  (System Settings → Privacy & Security → Accessibility). See *Waking an idle hotspot* below.
 - **Minimum home signal** — slider (Strict ⟷ Lenient). This is how strong home
   Wi-Fi must be before the app uses or keeps it. Slide toward **Strict** if a
   network shows good bars but performs badly — the app will then demand a stronger
@@ -70,7 +76,13 @@ Then open the menu and turn on **Launch at login**.
   not currently near (e.g. the office). Lists are sorted **most-seen-first**.
 - **Hotspot network** — pick which SSID is your iPhone hotspot. Filtered to
   phone-like names; everything else lives under **Other networks ▸**.
-- **Switch to home now / Switch to hotspot now** — manual override.
+- **Switch to home now / Switch to hotspot now** — manual override. Switching to the
+  hotspot **pins** it: auto-switch is paused and won't pull you back to home until you
+  resume it (below), switch elsewhere yourself, or the hotspot loses internet. Switching
+  to home resumes normal auto-switching. A manual switch from the **system Wi-Fi menu**
+  is detected and respected the same way. If a switch fails (e.g. an asleep iPhone
+  hotspot that can't be woken), you get an alert instead of silence.
+- **Resume auto-switch** — appears only while paused; clears the manual pin.
 - **Open log** — the decision log.
 
 ## How it decides (every ~30s, plus instantly on any Wi-Fi link/SSID change)
@@ -82,6 +94,10 @@ It only ever acts in the cases below — **a Wi-Fi network you picked yourself i
 - **Home lost / disconnected** (you left and it dropped) with no home in range → join the hotspot.
 - **On the hotspot (or disconnected) and a home comes into range** `≥ minSignal` → join home.
 - **On any other network** → do nothing.
+- **You manually switched** (the menu items or the system Wi-Fi menu) → that choice is
+  *pinned* and the join-home rule above is suppressed, so you're not yanked back. The pin
+  is dropped when you switch to home, resume auto-switch, or the pinned network is found
+  to have no working internet (then it still rescues you).
 
 - A `cooldownSeconds` window prevents rapid flapping.
 - **Connectivity backoff:** a network with no working internet is left and then avoided
@@ -92,6 +108,27 @@ It only ever acts in the cases below — **a Wi-Fi network you picked yourself i
   **hotspot only ~every 10 min** to spare cellular data.
 - Suppresses App Nap so it keeps monitoring with the lid closed (as long as the
   system stays awake, e.g. via Amphetamine).
+
+## Waking an idle hotspot (the hard problem, part two)
+
+`networksetup` can only join Wi-Fi networks that appear in a scan. An **idle** iPhone
+Personal Hotspot doesn't broadcast a beacon — macOS only knows it exists from a
+Bluetooth/Continuity advertisement, and surfaces it under "Personal Hotspot" in the
+Wi-Fi menu. Joining it there sends a Bluetooth command that powers the hotspot on.
+
+The private CoreWLAN API the system uses for this
+(`CWWiFiClient.startBrowsingForTetherDevices…`, `CWInterface.connectToTetherDevice…`)
+is gated behind AMFI-restricted entitlements (`com.apple.wifi.tether.browse` /
+`…connect`). A self-signed app that embeds them is **killed at launch** by AMFI, and
+there's no way around that short of disabling SIP.
+
+So **Wake idle hotspot** instead drives the system's *own* Control Center Wi-Fi popover
+through the Accessibility API: it finds the hotspot row (`AXIdentifier` =
+`wifi-network-<SSID>`) and presses it — identical to a manual click, including the
+Bluetooth wake. It's used only as a fallback, when a direct `networksetup` join fails
+because the phone is asleep. Trade-offs: it needs a one-time Accessibility grant, briefly
+flashes the Wi-Fi menu, and relies on Control Center's layout (could need a tweak across
+major macOS releases). It is off by default.
 
 ## Config / data
 
