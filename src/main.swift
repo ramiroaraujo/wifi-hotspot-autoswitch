@@ -30,12 +30,19 @@ struct Config: Codable {
     var enabled = true
     var connectivityCheck = true
     var netFailThreshold = 2    // consecutive failed internet probes before bailing
+    var weakThreshold = 3       // consecutive weak-signal reads before leaving home (anti-flap)
     var backoffBaseSeconds: Double = 600      // first retry wait after a dead-internet switch (10 min)
     var backoffMaxSeconds: Double = 6 * 3600  // cap on the exponential backoff (6 h)
     var hotspotProbeSeconds: Double = 600     // how often to re-verify the cellular hotspot (keep sparse)
 
     var rssiPrefer: Int { minSignal }
     var rssiDrop: Int { minSignal - hysteresisGap }
+
+    enum CodingKeys: String, CodingKey {
+        case interface, homeSSIDs, hotspotSSID, minSignal, hysteresisGap, cooldownSeconds, pollSeconds,
+             enabled, connectivityCheck, netFailThreshold, weakThreshold,
+             backoffBaseSeconds, backoffMaxSeconds, hotspotProbeSeconds
+    }
 
     static func dir() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -52,6 +59,29 @@ struct Config: Codable {
         try? FileManager.default.createDirectory(at: Config.dir(), withIntermediateDirectories: true)
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let d = try? enc.encode(self) { try? d.write(to: Config.path()) }
+    }
+}
+
+// Lenient decode: any missing key (e.g. a config.json from an older build) falls back
+// to its default, so evolving the schema never wipes the user's existing settings.
+extension Config {
+    init(from decoder: Decoder) throws {
+        self.init()
+        guard let c = try? decoder.container(keyedBy: CodingKeys.self) else { return }
+        interface = (try? c.decode(String.self, forKey: .interface)) ?? interface
+        homeSSIDs = (try? c.decode([String].self, forKey: .homeSSIDs)) ?? homeSSIDs
+        hotspotSSID = (try? c.decode(String.self, forKey: .hotspotSSID)) ?? hotspotSSID
+        minSignal = (try? c.decode(Int.self, forKey: .minSignal)) ?? minSignal
+        hysteresisGap = (try? c.decode(Int.self, forKey: .hysteresisGap)) ?? hysteresisGap
+        cooldownSeconds = (try? c.decode(Double.self, forKey: .cooldownSeconds)) ?? cooldownSeconds
+        pollSeconds = (try? c.decode(Double.self, forKey: .pollSeconds)) ?? pollSeconds
+        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? enabled
+        connectivityCheck = (try? c.decode(Bool.self, forKey: .connectivityCheck)) ?? connectivityCheck
+        netFailThreshold = (try? c.decode(Int.self, forKey: .netFailThreshold)) ?? netFailThreshold
+        weakThreshold = (try? c.decode(Int.self, forKey: .weakThreshold)) ?? weakThreshold
+        backoffBaseSeconds = (try? c.decode(Double.self, forKey: .backoffBaseSeconds)) ?? backoffBaseSeconds
+        backoffMaxSeconds = (try? c.decode(Double.self, forKey: .backoffMaxSeconds)) ?? backoffMaxSeconds
+        hotspotProbeSeconds = (try? c.decode(Double.self, forKey: .hotspotProbeSeconds)) ?? hotspotProbeSeconds
     }
 }
 
@@ -220,7 +250,7 @@ func backoffWait(fails: Int, base: Double, cap: Double) -> Double {
     min(cap, base * pow(2, Double(Swift.max(0, fails - 1))))
 }
 
-func decide(config: Config, state: WifiState, last: PersistedState, now: Double, currentInternetBad: Bool) -> Action {
+func decide(config: Config, state: WifiState, last: PersistedState, now: Double, currentInternetBad: Bool, homeSignalWeak: Bool) -> Action {
     let cur = state.current?.ssid
     let rssi = state.current?.rssi ?? 0
     let onHome = cur.map { config.homeSSIDs.contains($0) } ?? false
@@ -234,17 +264,17 @@ func decide(config: Config, state: WifiState, last: PersistedState, now: Double,
         return .none("on other network '\(c)' — leaving it alone")
     }
 
-    // On home: leave only if signal went weak OR the internet stopped working.
+    // On home: leave only if the signal stayed weak (debounced) OR the internet stopped working.
     if onHome {
-        let weak = rssi < config.rssiDrop
-        if weak || currentInternetBad {
+        if homeSignalWeak || currentInternetBad {
             guard let hs = config.hotspotSSID, !hs.isEmpty else {
-                return .none("home '\(cur ?? "?")' \(weak ? "weak" : "no internet") but no hotspot set")
+                return .none("home '\(cur ?? "?")' \(homeSignalWeak ? "weak" : "no internet") but no hotspot set")
             }
+            if blocked(hs) { return .none("home '\(cur ?? "?")' \(homeSignalWeak ? "weak" : "no internet"), but hotspot in backoff — staying") }
             if coolingDown { return .none("would leave home but cooling down") }
-            let reason = weak ? "home '\(cur ?? "?")' weak (\(rssi)dBm < \(config.rssiDrop))"
-                              : "home '\(cur ?? "?")' has no working internet"
-            return .join(ssid: hs, reason: reason, penalizeLeftNet: !weak && currentInternetBad)
+            let reason = homeSignalWeak ? "home '\(cur ?? "?")' weak (\(rssi)dBm < \(config.rssiDrop))"
+                                        : "home '\(cur ?? "?")' has no working internet"
+            return .join(ssid: hs, reason: reason, penalizeLeftNet: !homeSignalWeak && currentInternetBad)
         }
         return .none("on home '\(cur ?? "?")' (\(rssi)dBm) — fine")
     }
@@ -343,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
     var lastWifi: WifiState?
     var lastInternetOK: Bool?
     var consecutiveNetFails = 0
+    var consecutiveWeakReads = 0      // debounce the weak-signal bail
     var lastHotspotProbe: Double = 0  // throttle cellular internet probes
     var timer: Timer?
     let work = DispatchQueue(label: "wifiautoswitch.cycle")
@@ -430,7 +461,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
             consecutiveNetFails = 0
         }
 
-        let action = decide(config: config, state: wifi, last: state, now: now, currentInternetBad: currentInternetBad)
+        // Debounce the weak-signal trigger: only treat home as "weak" after several
+        // consecutive low reads, so a momentary dip doesn't bounce us off home.
+        var homeSignalWeak = false
+        if onHome {
+            consecutiveWeakReads = (wifi.current?.rssi ?? 0) < config.rssiDrop ? consecutiveWeakReads + 1 : 0
+            homeSignalWeak = consecutiveWeakReads >= config.weakThreshold
+        } else {
+            consecutiveWeakReads = 0
+        }
+
+        let action = decide(config: config, state: wifi, last: state, now: now,
+                            currentInternetBad: currentInternetBad, homeSignalWeak: homeSignalWeak)
         switch action {
         case .none(let reason):
             logLine("noop: \(reason)")
@@ -440,6 +482,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
             if r.ok {
                 state.lastSwitchEpoch = now
                 state.lastTarget = ssid
+                state.backoff[ssid] = nil            // joined fine → clear any backoff on the target
                 if penalizeLeftNet, let ln = leftNet {
                     var b = state.backoff[ln] ?? Backoff(fails: 0, until: 0)
                     b.fails += 1
@@ -449,11 +492,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
                     logLine("backoff '\(ln)' ×\(b.fails) → retry in ~\(Int(wait / 60))min")
                 }
                 state.save()
-                consecutiveNetFails = 0
+                consecutiveNetFails = 0; consecutiveWeakReads = 0
                 if ssid == config.hotspotSSID { lastHotspotProbe = 0 } // force a fresh verify of the new hotspot session
                 logLine("SWITCHED → '\(ssid)' :: \(reason)")
             } else {
-                logLine("FAILED → '\(ssid)' :: \(reason) :: \(r.output)")
+                // Couldn't join (e.g. an idle hotspot that can't be woken) → back off this
+                // target so we don't retry it on every cycle.
+                var b = state.backoff[ssid] ?? Backoff(fails: 0, until: 0)
+                b.fails += 1
+                let wait = backoffWait(fails: b.fails, base: config.backoffBaseSeconds, cap: config.backoffMaxSeconds)
+                b.until = now + wait
+                state.backoff[ssid] = b
+                state.save()
+                logLine("FAILED → '\(ssid)' :: \(reason) :: \(r.output) (backoff ~\(Int(wait / 60))min)")
             }
             DispatchQueue.main.async { self.updateButton() }
         }
@@ -461,20 +512,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
 
     // MARK: status button
 
-    // Distinct from the system Wi-Fi glyph so it's findable in the menu bar.
-    func symbolName() -> String {
-        guard let w = lastWifi else { return "antenna.radiowaves.left.and.right" }
-        if !w.authorized || w.redacted { return "exclamationmark.triangle" }
-        if !config.enabled { return "pause.circle" }
-        if let s = w.current?.ssid, s == config.hotspotSSID { return "personalhotspot" }
-        return "antenna.radiowaves.left.and.right"
+    enum StatusIcon {
+        case symbol(String, NSColor?)
+    }
+
+    func statusIcon() -> StatusIcon {
+        guard let w = lastWifi else { return .symbol("antenna.radiowaves.left.and.right", nil) }
+        if !w.authorized || w.redacted { return .symbol("exclamationmark.triangle", nil) }
+        if !config.enabled { return .symbol("pause.circle", nil) }
+        if let s = w.current?.ssid, s == config.hotspotSSID {
+            return .symbol(
+                "antenna.radiowaves.left.and.right",
+                NSColor(calibratedRed: 27 / 255, green: 112 / 255, blue: 212 / 255, alpha: 1)
+            )
+        }
+        return .symbol("antenna.radiowaves.left.and.right", nil)
     }
 
     func updateButton() {
         guard let button = statusItem.button else { return }
-        let img = NSImage(systemSymbolName: symbolName(), accessibilityDescription: "WifiAutoswitch")
-        img?.isTemplate = true
-        button.image = img
+        switch statusIcon() {
+        case .symbol(let name, let tint):
+            let img = NSImage(systemSymbolName: name, accessibilityDescription: "WifiAutoswitch")
+            img?.isTemplate = true
+            button.contentTintColor = tint
+            button.image = img
+        }
         button.toolTip = statusText()
     }
 
@@ -722,6 +785,7 @@ func cmdSelftest() {
     let fresh = PersistedState()
     let cooling = PersistedState(lastSwitchEpoch: 1000)
     var blockedState = PersistedState(); blockedState.backoff["HomeWiFi"] = Backoff(fails: 1, until: 9999)
+    var hotspotBlocked = PersistedState(); hotspotBlocked.backoff["MyPhone"] = Backoff(fails: 1, until: 9999)
     func S(_ cur: NetInfo?, _ scan: [NetInfo]) -> WifiState {
         WifiState(interface: "en0", authStatus: "authorizedAlways", authorized: true, redacted: false, current: cur, scan: scan, scanError: nil)
     }
@@ -732,31 +796,35 @@ func cmdSelftest() {
     let homeOkCur = NetInfo(ssid: "HomeWiFi", bssid: nil, rssi: -55, channel: 149, band: "5GHz")
     let otherCur = NetInfo(ssid: "CoffeeShop", bssid: nil, rssi: -50, channel: 6, band: "2GHz")
 
-    check("join home from hotspot", decide(config: c, state: S(hotspot, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false),
+    check("join home from hotspot", decide(config: c, state: S(hotspot, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .join(ssid: "HomeWiFi", reason: "home 'HomeWiFi' in range (-45dBm ≥ -68)", penalizeLeftNet: false))
-    check("on hotspot, weak home → stay", decide(config: c, state: S(hotspot, [orimarWeak]), last: fresh, now: 5000, currentInternetBad: false),
+    check("on hotspot, weak home → stay", decide(config: c, state: S(hotspot, [orimarWeak]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("on hotspot; home 'HomeWiFi' too weak (-80dBm < -68)"))
-    check("on hotspot, no home → stay", decide(config: c, state: S(hotspot, []), last: fresh, now: 5000, currentInternetBad: false),
+    check("on hotspot, no home → stay", decide(config: c, state: S(hotspot, []), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("on hotspot, no home in range — staying"))
-    check("on good home → noop", decide(config: c, state: S(homeOkCur, []), last: fresh, now: 5000, currentInternetBad: false),
+    check("on good home → noop", decide(config: c, state: S(homeOkCur, []), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("on home 'HomeWiFi' (-55dBm) — fine"))
-    check("weak home → hotspot", decide(config: c, state: S(homeWeakCur, []), last: fresh, now: 5000, currentInternetBad: false),
+    check("home weak but NOT debounced → stay", decide(config: c, state: S(homeWeakCur, []), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
+          .none("on home 'HomeWiFi' (-82dBm) — fine"))
+    check("home weak (debounced) → hotspot", decide(config: c, state: S(homeWeakCur, []), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: true),
           .join(ssid: "MyPhone", reason: "home 'HomeWiFi' weak (-82dBm < -74)", penalizeLeftNet: false))
-    check("good home, dead internet → hotspot+backoff", decide(config: c, state: S(homeOkCur, []), last: fresh, now: 5000, currentInternetBad: true),
+    check("home weak but hotspot in backoff → stay", decide(config: c, state: S(homeWeakCur, []), last: hotspotBlocked, now: 5000, currentInternetBad: false, homeSignalWeak: true),
+          .none("home 'HomeWiFi' weak, but hotspot in backoff — staying"))
+    check("good home, dead internet → hotspot+backoff", decide(config: c, state: S(homeOkCur, []), last: fresh, now: 5000, currentInternetBad: true, homeSignalWeak: false),
           .join(ssid: "MyPhone", reason: "home 'HomeWiFi' has no working internet", penalizeLeftNet: true))
-    check("LOST HOME (disconnected) → hotspot", decide(config: c, state: S(nil, []), last: fresh, now: 5000, currentInternetBad: false),
+    check("LOST HOME (disconnected) → hotspot", decide(config: c, state: S(nil, []), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .join(ssid: "MyPhone", reason: "disconnected and no home in range — joining hotspot", penalizeLeftNet: false))
-    check("disconnected but home in range → home", decide(config: c, state: S(nil, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false),
+    check("disconnected but home in range → home", decide(config: c, state: S(nil, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .join(ssid: "HomeWiFi", reason: "home 'HomeWiFi' in range (-45dBm ≥ -68)", penalizeLeftNet: false))
-    check("on OTHER wifi → leave alone", decide(config: c, state: S(otherCur, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false),
+    check("on OTHER wifi → leave alone", decide(config: c, state: S(otherCur, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("on other network 'CoffeeShop' — leaving it alone"))
-    check("cooldown blocks join", decide(config: c, state: S(hotspot, [orimarStrong]), last: cooling, now: 1030, currentInternetBad: false),
+    check("cooldown blocks join", decide(config: c, state: S(hotspot, [orimarStrong]), last: cooling, now: 1030, currentInternetBad: false, homeSignalWeak: false),
           .none("would join 'HomeWiFi' but cooling down"))
-    check("backed-off home not rejoined", decide(config: c, state: S(hotspot, [orimarStrong]), last: blockedState, now: 5000, currentInternetBad: false),
+    check("backed-off home not rejoined", decide(config: c, state: S(hotspot, [orimarStrong]), last: blockedState, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("home 'HomeWiFi' in range but in backoff — staying on hotspot"))
     var multi = c; multi.homeSSIDs = ["HomeWiFi", "Office"]
     let office = NetInfo(ssid: "Office", bssid: nil, rssi: -50, channel: 36, band: "5GHz")
-    check("multiple homes: joins whichever is in range", decide(config: multi, state: S(hotspot, [office]), last: fresh, now: 5000, currentInternetBad: false),
+    check("multiple homes: joins whichever is in range", decide(config: multi, state: S(hotspot, [office]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .join(ssid: "Office", reason: "home 'Office' in range (-50dBm ≥ -68)", penalizeLeftNet: false))
 
     var sc = NetworkScores()
@@ -768,6 +836,11 @@ func cmdSelftest() {
     let w = (1...4).map { backoffWait(fails: $0, base: 600, cap: 21600) }
     if w == [600, 1200, 2400, 4800] && backoffWait(fails: 99, base: 600, cap: 21600) == 21600 { print("ok   backoff doubles then caps") }
     else { print("FAIL backoff: \(w)"); fail += 1 }
+
+    let partial = #"{"homeSSIDs":["X"],"minSignal":-55}"#.data(using: .utf8)!
+    let lc = (try? JSONDecoder().decode(Config.self, from: partial)) ?? Config()
+    if lc.homeSSIDs == ["X"] && lc.minSignal == -55 && lc.weakThreshold == 3 && lc.hotspotProbeSeconds == 600 { print("ok   config decodes leniently (missing keys default)") }
+    else { print("FAIL lenient config: home=\(lc.homeSSIDs) min=\(lc.minSignal) weak=\(lc.weakThreshold)"); fail += 1 }
 
     print(fail == 0 ? "\nALL PASS" : "\n\(fail) FAILED")
     exit(fail == 0 ? 0 : 1)
