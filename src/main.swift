@@ -29,12 +29,10 @@ struct Config: Codable {
     var cooldownSeconds: Double = 45
     var pollSeconds: Double = 30
     var enabled = true
-    var connectivityCheck = true
-    var netFailThreshold = 2    // consecutive failed internet probes before bailing
+    var netFailThreshold = 2    // consecutive failed internet probes (on home Wi-Fi) before bailing
     var weakThreshold = 3       // consecutive weak-signal reads before leaving home (anti-flap)
     var backoffBaseSeconds: Double = 600      // first retry wait after a dead-internet switch (10 min)
     var backoffMaxSeconds: Double = 6 * 3600  // cap on the exponential backoff (6 h)
-    var hotspotProbeSeconds: Double = 600     // how often to re-verify the cellular hotspot (keep sparse)
     var hotspotWakeViaUI = false              // wake an idle Instant Hotspot by clicking it in the Control Center Wi-Fi menu (needs Accessibility)
 
     var rssiPrefer: Int { minSignal }
@@ -42,8 +40,8 @@ struct Config: Codable {
 
     enum CodingKeys: String, CodingKey {
         case interface, homeSSIDs, hotspotSSID, minSignal, hysteresisGap, cooldownSeconds, pollSeconds,
-             enabled, connectivityCheck, netFailThreshold, weakThreshold,
-             backoffBaseSeconds, backoffMaxSeconds, hotspotProbeSeconds, hotspotWakeViaUI
+             enabled, netFailThreshold, weakThreshold,
+             backoffBaseSeconds, backoffMaxSeconds, hotspotWakeViaUI
     }
 
     static func dir() -> URL {
@@ -78,12 +76,10 @@ extension Config {
         cooldownSeconds = (try? c.decode(Double.self, forKey: .cooldownSeconds)) ?? cooldownSeconds
         pollSeconds = (try? c.decode(Double.self, forKey: .pollSeconds)) ?? pollSeconds
         enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? enabled
-        connectivityCheck = (try? c.decode(Bool.self, forKey: .connectivityCheck)) ?? connectivityCheck
         netFailThreshold = (try? c.decode(Int.self, forKey: .netFailThreshold)) ?? netFailThreshold
         weakThreshold = (try? c.decode(Int.self, forKey: .weakThreshold)) ?? weakThreshold
         backoffBaseSeconds = (try? c.decode(Double.self, forKey: .backoffBaseSeconds)) ?? backoffBaseSeconds
         backoffMaxSeconds = (try? c.decode(Double.self, forKey: .backoffMaxSeconds)) ?? backoffMaxSeconds
-        hotspotProbeSeconds = (try? c.decode(Double.self, forKey: .hotspotProbeSeconds)) ?? hotspotProbeSeconds
         hotspotWakeViaUI = (try? c.decode(Bool.self, forKey: .hotspotWakeViaUI)) ?? hotspotWakeViaUI
     }
 }
@@ -459,7 +455,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
     var lastInternetOK: Bool?
     var consecutiveNetFails = 0
     var consecutiveWeakReads = 0      // debounce the weak-signal bail
-    var lastHotspotProbe: Double = 0  // throttle cellular internet probes
     var lastSeenSSID: String?         // SSID observed last cycle (to spot a change)
     var lastCommandedSSID: String?    // last SSID *we* joined (so a self-initiated change isn't read as manual)
     var sawFirstCycle = false         // first read just sets the baseline; never treated as a manual switch
@@ -529,7 +524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
     @objc func systemDidWake() {
         loc.start()  // re-arm the location session after sleep
         // Give Wi-Fi a few seconds to power up and finish its own join attempt first.
-        work.asyncAfter(deadline: .now() + 3) { [weak self] in self?.lastHotspotProbe = 0; self?.runCycle() }
+        work.asyncAfter(deadline: .now() + 3) { [weak self] in self?.runCycle() }
     }
 
     func scheduleTimer() {
@@ -556,11 +551,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
 
         guard config.enabled else { return }
 
-        // Verify internet on the network we're sitting on. Home is unmetered → probe
-        // every cycle. The hotspot is cellular → probe sparingly (every hotspotProbeSeconds).
         let cur = wifi.current?.ssid
         let onHome = cur.map { config.homeSSIDs.contains($0) } ?? false
-        let onHotspot = cur != nil && cur == config.hotspotSSID
 
         // Detect a switch we didn't initiate (e.g. the system Wi-Fi menu) and honour it:
         // landing on a non-home network we didn't command pins it (auto-switch paused), while
@@ -580,17 +572,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
             lastSeenSSID = cur
         }
 
+        // Verify the internet only on home Wi-Fi (unmetered) — every cycle. The hotspot is
+        // cellular, so we never probe it (assume it works once joined; spare the data).
         var currentInternetBad = false
-        if config.connectivityCheck, let cur = cur, onHome || onHotspot {
-            let shouldProbe = onHome || (now - lastHotspotProbe >= config.hotspotProbeSeconds)
-            if shouldProbe {
-                if onHotspot { lastHotspotProbe = now }
-                let ok = internetWorks()
-                consecutiveNetFails = ok ? 0 : consecutiveNetFails + 1
-                lastInternetOK = ok
-                if ok, state.backoff[cur] != nil { state.backoff[cur] = nil; state.save() } // recovered → clear backoff
-                currentInternetBad = consecutiveNetFails >= config.netFailThreshold
-            }
+        if onHome, let cur = cur {
+            let ok = internetWorks()
+            consecutiveNetFails = ok ? 0 : consecutiveNetFails + 1
+            lastInternetOK = ok
+            if ok, state.backoff[cur] != nil { state.backoff[cur] = nil; state.save() }  // recovered → clear backoff
+            currentInternetBad = consecutiveNetFails >= config.netFailThreshold
         } else {
             lastInternetOK = nil
             consecutiveNetFails = 0
@@ -633,7 +623,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
                 }
                 state.save()
                 consecutiveNetFails = 0; consecutiveWeakReads = 0
-                if ssid == config.hotspotSSID { lastHotspotProbe = 0 } // force a fresh verify of the new hotspot session
                 logLine("SWITCHED → '\(ssid)' :: \(reason)")
             } else {
                 // Couldn't join (e.g. an idle hotspot that can't be woken) → back off this
@@ -716,12 +705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         menu.addItem(status)
         menu.addItem(.separator())
 
-        addCheck(menu, "Auto-switch", config.enabled, #selector(toggleEnabled))
-        addCheck(menu, "Verify internet works", config.connectivityCheck, #selector(toggleConnectivity))
-        let wakeTitle = (config.hotspotWakeViaUI && !AXIsProcessTrusted())
-            ? "Wake idle hotspot — needs Accessibility ⚠︎"
-            : "Wake idle hotspot (uses Accessibility)"
-        addCheck(menu, wakeTitle, config.hotspotWakeViaUI, #selector(toggleHotspotWake))
+        addCheck(menu, "Wake idle hotspot", config.hotspotWakeViaUI, #selector(toggleHotspotWake))
         menu.addItem(.separator())
 
         // Signal slider
@@ -734,14 +718,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         menu.addItem(submenuItem("Hotspot network", build: hotspotSubmenu()))
         menu.addItem(.separator())
 
-        let homeNow = NSMenuItem(title: "Switch to home now", action: #selector(switchHomeNow), keyEquivalent: "")
-        homeNow.target = self
-        homeNow.isEnabled = bestVisibleHome() != nil
-        menu.addItem(homeNow)
-        let hsNow = NSMenuItem(title: "Switch to hotspot now", action: #selector(switchHotspotNow), keyEquivalent: "")
-        hsNow.target = self
-        hsNow.isEnabled = !(config.hotspotSSID ?? "").isEmpty
-        menu.addItem(hsNow)
+        // Only offer the switch you're not already in.
+        let curSSID = lastWifi?.current?.ssid
+        let onHome = curSSID.map { config.homeSSIDs.contains($0) } ?? false
+        let onHotspot = curSSID != nil && curSSID == config.hotspotSSID
+        if !onHome {
+            let homeNow = NSMenuItem(title: "Switch to home now", action: #selector(switchHomeNow), keyEquivalent: "")
+            homeNow.target = self
+            homeNow.isEnabled = bestVisibleHome() != nil
+            menu.addItem(homeNow)
+        }
+        if !onHotspot, !(config.hotspotSSID ?? "").isEmpty {
+            let hsNow = NSMenuItem(title: "Switch to hotspot now", action: #selector(switchHotspotNow), keyEquivalent: "")
+            hsNow.target = self
+            menu.addItem(hsNow)
+        }
         if let pin = state.pinnedSSID {
             let resume = NSMenuItem(title: "Resume auto-switch (paused on “\(pin)”)", action: #selector(resumeAuto), keyEquivalent: "")
             resume.target = self
@@ -852,8 +843,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
 
     // MARK: actions
 
-    @objc func toggleEnabled() { config.enabled.toggle(); config.save(); updateButton(); work.async { self.runCycle() } }
-    @objc func toggleConnectivity() { config.connectivityCheck.toggle(); config.save() }
     @objc func toggleHotspotWake() {
         config.hotspotWakeViaUI.toggle(); config.save()
         guard config.hotspotWakeViaUI, !AXIsProcessTrusted() else { return }
@@ -917,7 +906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
     @objc func switchHotspotNow() {
         guard let s = config.hotspotSSID, !s.isEmpty else { return }
         work.async {
-            self.state.backoff.removeAll(); self.consecutiveNetFails = 0; self.lastHotspotProbe = 0
+            self.state.backoff.removeAll(); self.consecutiveNetFails = 0
             let inScan = uniqueNetworks(self.lastWifi).contains { $0.ssid == s }
             let r = joinNetwork(s, interface: self.config.interface, wakeViaUI: self.config.hotspotWakeViaUI, hotspotInScan: inScan)
             if r.ok {
@@ -1048,7 +1037,7 @@ func cmdSelftest() {
 
     let partial = #"{"homeSSIDs":["X"],"minSignal":-55}"#.data(using: .utf8)!
     let lc = (try? JSONDecoder().decode(Config.self, from: partial)) ?? Config()
-    if lc.homeSSIDs == ["X"] && lc.minSignal == -55 && lc.weakThreshold == 3 && lc.hotspotProbeSeconds == 600 { print("ok   config decodes leniently (missing keys default)") }
+    if lc.homeSSIDs == ["X"] && lc.minSignal == -55 && lc.weakThreshold == 3 && lc.netFailThreshold == 2 { print("ok   config decodes leniently (missing keys default)") }
     else { print("FAIL lenient config: home=\(lc.homeSSIDs) min=\(lc.minSignal) weak=\(lc.weakThreshold)"); fail += 1 }
 
     print(fail == 0 ? "\nALL PASS" : "\n\(fail) FAILED")

@@ -58,9 +58,7 @@ Then open the menu and turn on **Launch at login**.
 ## Using it (the menu)
 
 - **Status line** — current network, signal, and internet check (`internet ✓/✗`).
-- **Auto-switch** — master on/off.
-- **Verify internet works** — enable the captive-portal / dead-internet probe.
-- **Wake idle hotspot (uses Accessibility)** — opt-in. An *idle* iPhone Personal Hotspot
+- **Wake idle hotspot** — opt-in (default off). An *idle* iPhone Personal Hotspot
   isn't broadcasting Wi-Fi (it's advertised over Bluetooth/Continuity), so `networksetup`
   can't join it. With this on, when a hotspot join fails because the phone is asleep, the
   app wakes + joins it by pressing its row in the Control Center Wi-Fi menu for you — the
@@ -104,8 +102,8 @@ It only ever acts in the cases below — **a Wi-Fi network you picked yourself i
   with **exponential backoff** — retry after 10 min, then 20, 40, 80 … capped at 6 h.
   Each failed retry doubles the wait; a passing check clears it. **Manually switching**
   (the "Switch to … now" items) resets all backoff.
-- Internet is verified on the network you're on: **home every cycle** (unmetered); the
-  **hotspot only ~every 10 min** to spare cellular data.
+- Internet is verified **only on home Wi-Fi**, every cycle (it's unmetered). The hotspot
+  is never probed — it's cellular, and we assume it works once joined, to spare your data.
 - Suppresses App Nap so it keeps monitoring with the lid closed (as long as the
   system stays awake, e.g. via Amphetamine).
 
@@ -141,7 +139,7 @@ major macOS releases). It is off by default.
 - `switch.log` — decisions and switches.
 
 Defaults: `minSignal -68`, `hysteresisGap 6`, `cooldown 45s`, `poll 30s`,
-`netFailThreshold 2`, `backoffBase 600s`, `backoffMax 6h`, `hotspotProbe 600s`.
+`netFailThreshold 2`, `backoffBase 600s`, `backoffMax 6h`.
 
 ## Dev / debugging
 
