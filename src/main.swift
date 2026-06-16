@@ -353,6 +353,14 @@ enum AX {
     static func str(_ el: AXUIElement, _ a: String) -> String { (attr(el, a) as? String) ?? "" }
     static func children(_ el: AXUIElement) -> [AXUIElement] { (attr(el, "AXChildren") as? [AXUIElement]) ?? [] }
     @discardableResult static func press(_ el: AXUIElement) -> Bool { AXUIElementPerformAction(el, "AXPress" as CFString) == .success }
+    /// Dismiss an open Control Center popover by synthesizing an Escape keypress.
+    /// AXPress on a row joins the network but, unlike a real mouse click, leaves the
+    /// popover on screen; Escape closes it (and is a harmless no-op if already closed).
+    static func sendEscape() {
+        let src = CGEventSource(stateID: .combinedSessionState)
+        CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true)?.post(tap: .cghidEventTap)   // 53 = Escape
+        CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: false)?.post(tap: .cghidEventTap)
+    }
     static func find(_ root: AXUIElement, identifier: String, depth: Int = 0) -> AXUIElement? {
         if depth > 12 { return nil }
         if str(root, "AXIdentifier") == identifier { return root }
@@ -382,7 +390,9 @@ func pressHotspotRowInControlCenter(_ ssid: String) -> Bool {
         Thread.sleep(forTimeInterval: 0.15)
     }
     guard let target = row else { AX.press(wifi); return false }   // not advertising → close the popover and bail
-    AX.press(target)   // selecting the network dismisses the popover itself
+    AX.press(target)   // join the network
+    Thread.sleep(forTimeInterval: 0.2)   // let the press register before dismissing the UI
+    AX.sendEscape()   // AXPress leaves the popover open — close it so it doesn't linger
     return true
 }
 
