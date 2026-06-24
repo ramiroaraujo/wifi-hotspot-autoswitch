@@ -31,6 +31,8 @@ struct Config: Codable {
     var enabled = true
     var netFailThreshold = 2    // consecutive failed internet probes (on home Wi-Fi) before bailing
     var weakThreshold = 3       // consecutive weak-signal reads before leaving home (anti-flap)
+    var homeJoinConfirmations = 3        // sightings required before leaving the hotspot for home
+    var homeJoinWindowSeconds: Double = 120  // home must stay strong across this window before auto-join
     var backoffBaseSeconds: Double = 600      // first retry wait after a dead-internet switch (10 min)
     var backoffMaxSeconds: Double = 6 * 3600  // cap on the exponential backoff (6 h)
     var hotspotWakeViaUI = false              // wake an idle Instant Hotspot by clicking it in the Control Center Wi-Fi menu (needs Accessibility)
@@ -41,6 +43,7 @@ struct Config: Codable {
     enum CodingKeys: String, CodingKey {
         case interface, homeSSIDs, hotspotSSID, minSignal, hysteresisGap, cooldownSeconds, pollSeconds,
              enabled, netFailThreshold, weakThreshold,
+             homeJoinConfirmations, homeJoinWindowSeconds,
              backoffBaseSeconds, backoffMaxSeconds, hotspotWakeViaUI
     }
 
@@ -78,6 +81,8 @@ extension Config {
         enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? enabled
         netFailThreshold = (try? c.decode(Int.self, forKey: .netFailThreshold)) ?? netFailThreshold
         weakThreshold = (try? c.decode(Int.self, forKey: .weakThreshold)) ?? weakThreshold
+        homeJoinConfirmations = (try? c.decode(Int.self, forKey: .homeJoinConfirmations)) ?? homeJoinConfirmations
+        homeJoinWindowSeconds = (try? c.decode(Double.self, forKey: .homeJoinWindowSeconds)) ?? homeJoinWindowSeconds
         backoffBaseSeconds = (try? c.decode(Double.self, forKey: .backoffBaseSeconds)) ?? backoffBaseSeconds
         backoffMaxSeconds = (try? c.decode(Double.self, forKey: .backoffMaxSeconds)) ?? backoffMaxSeconds
         hotspotWakeViaUI = (try? c.decode(Bool.self, forKey: .hotspotWakeViaUI)) ?? hotspotWakeViaUI
@@ -225,6 +230,54 @@ func uniqueNetworks(_ state: WifiState?) -> [(ssid: String, rssi: Int)] {
     return best.map { ($0.key, $0.value) }.sorted { $0.rssi > $1.rssi }
 }
 
+/// Tracks home SSIDs that remain strong enough while the Mac is on the hotspot.
+/// A single good scan is not enough to leave cellular: the same home network must
+/// stay above `minSignal` for the configured confirmation window.
+struct HomeJoinTracker {
+    struct Observation {
+        var firstSeen: Double
+        var reads: Int
+        var lastSeen: Double
+        var lastRSSI: Int
+    }
+
+    var observations: [String: Observation] = [:]
+
+    mutating func reset() { observations.removeAll() }
+
+    mutating func confirmedHomeSSIDs(config: Config, state: WifiState, backoff: [String: Backoff], now: Double, shouldTrack: Bool) -> Set<String> {
+        guard shouldTrack else {
+            reset()
+            return []
+        }
+
+        func blocked(_ s: String) -> Bool { (backoff[s]?.until ?? 0) > now }
+        let strongHomes = uniqueNetworks(state)
+            .filter { config.homeSSIDs.contains($0.ssid) && !blocked($0.ssid) && $0.rssi >= config.rssiPrefer }
+        let visibleStrongHomeSSIDs = Set(strongHomes.map { $0.ssid })
+
+        for ssid in Array(observations.keys) where !visibleStrongHomeSSIDs.contains(ssid) {
+            observations[ssid] = nil
+        }
+        for home in strongHomes {
+            if var obs = observations[home.ssid] {
+                obs.reads += 1
+                obs.lastSeen = now
+                obs.lastRSSI = home.rssi
+                observations[home.ssid] = obs
+            } else {
+                observations[home.ssid] = Observation(firstSeen: now, reads: 1, lastSeen: now, lastRSSI: home.rssi)
+            }
+        }
+
+        let requiredReads = max(1, config.homeJoinConfirmations)
+        let requiredWindow = max(0, config.homeJoinWindowSeconds)
+        return Set(observations.compactMap { ssid, obs in
+            obs.reads >= requiredReads && (now - obs.firstSeen) >= requiredWindow ? ssid : nil
+        })
+    }
+}
+
 // Tell a phone/Personal Hotspot from a fixed AP. There is no public CoreWLAN API
 // for this (Apple's menu icon comes from Continuity/Bluetooth + private info
 // elements). The locally-administered-BSSID signal proved far too noisy in the
@@ -250,7 +303,7 @@ func backoffWait(fails: Int, base: Double, cap: Double) -> Double {
     min(cap, base * pow(2, Double(Swift.max(0, fails - 1))))
 }
 
-func decide(config: Config, state: WifiState, last: PersistedState, now: Double, currentInternetBad: Bool, homeSignalWeak: Bool) -> Action {
+func decide(config: Config, state: WifiState, last: PersistedState, now: Double, currentInternetBad: Bool, homeSignalWeak: Bool, confirmedHomeSSIDs: Set<String> = []) -> Action {
     let cur = state.current?.ssid
     let rssi = state.current?.rssi ?? 0
     let onHome = cur.map { config.homeSSIDs.contains($0) } ?? false
@@ -280,9 +333,10 @@ func decide(config: Config, state: WifiState, last: PersistedState, now: Double,
     }
 
     // On the hotspot or disconnected: prefer a strong home that isn't in backoff.
-    let bestHome = uniqueNetworks(state)
+    let visibleHomes = uniqueNetworks(state)
         .filter { config.homeSSIDs.contains($0.ssid) && !blocked($0.ssid) }
-        .sorted { $0.rssi > $1.rssi }.first
+        .sorted { $0.rssi > $1.rssi }
+    let bestHome = visibleHomes.first
     if let best = bestHome, best.rssi >= config.rssiPrefer {
         if cur == best.ssid { return .none("already on '\(best.ssid)'") }
         // The user manually chose the current network → don't yank them back to home.
@@ -290,9 +344,15 @@ func decide(config: Config, state: WifiState, last: PersistedState, now: Double,
         if let pin = last.pinnedSSID, cur == pin, !currentInternetBad {
             return .none("'\(best.ssid)' in range, but staying on manually-chosen '\(pin)' — auto-switch paused")
         }
-        if coolingDown { return .none("would join '\(best.ssid)' but cooling down") }
+        let targetHome = (onHotspot && !currentInternetBad)
+            ? visibleHomes.first { $0.rssi >= config.rssiPrefer && confirmedHomeSSIDs.contains($0.ssid) }
+            : best
+        guard let target = targetHome else {
+            return .none("home '\(best.ssid)' in range (\(best.rssi)dBm ≥ \(config.rssiPrefer)), waiting for stable signal")
+        }
+        if coolingDown { return .none("would join '\(target.ssid)' but cooling down") }
         // Leaving the hotspot because IT has no internet? penalize the hotspot.
-        return .join(ssid: best.ssid, reason: "home '\(best.ssid)' in range (\(best.rssi)dBm ≥ \(config.rssiPrefer))", penalizeLeftNet: onHotspot && currentInternetBad)
+        return .join(ssid: target.ssid, reason: "home '\(target.ssid)' in range (\(target.rssi)dBm ≥ \(config.rssiPrefer))", penalizeLeftNet: onHotspot && currentInternetBad)
     }
 
     // No usable home in range. If we're disconnected, get onto 5G (ignore backoff as a last resort).
@@ -465,6 +525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
     var lastInternetOK: Bool?
     var consecutiveNetFails = 0
     var consecutiveWeakReads = 0      // debounce the weak-signal bail
+    var homeJoinTracker = HomeJoinTracker()
     var lastSeenSSID: String?         // SSID observed last cycle (to spot a change)
     var lastCommandedSSID: String?    // last SSID *we* joined (so a self-initiated change isn't read as manual)
     var sawFirstCycle = false         // first read just sets the baseline; never treated as a manual switch
@@ -550,6 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         DispatchQueue.main.async { self.lastWifi = wifi; self.updateButton() }
 
         guard wifi.authorized, !wifi.redacted else {
+            homeJoinTracker.reset()
             logLine("ABORT: \(wifi.redacted ? "redacted scan" : "not authorized (\(wifi.authStatus))") — doing nothing")
             return
         }
@@ -559,10 +621,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         let seen = uniqueNetworks(wifi).map { $0.ssid }
         if !seen.isEmpty { DispatchQueue.main.async { self.scores.bump(seen, now: now); self.scores.save() } }
 
-        guard config.enabled else { return }
+        guard config.enabled else {
+            homeJoinTracker.reset()
+            return
+        }
 
         let cur = wifi.current?.ssid
         let onHome = cur.map { config.homeSSIDs.contains($0) } ?? false
+        let onHotspot = cur != nil && cur == config.hotspotSSID
 
         // Detect a switch we didn't initiate (e.g. the system Wi-Fi menu) and honour it:
         // landing on a non-home network we didn't command pins it (auto-switch paused), while
@@ -606,8 +672,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
             consecutiveWeakReads = 0
         }
 
+        let confirmedHomeSSIDs = homeJoinTracker.confirmedHomeSSIDs(config: config, state: wifi, backoff: state.backoff,
+                                                                    now: now, shouldTrack: onHotspot)
         let action = decide(config: config, state: wifi, last: state, now: now,
-                            currentInternetBad: currentInternetBad, homeSignalWeak: homeSignalWeak)
+                            currentInternetBad: currentInternetBad, homeSignalWeak: homeSignalWeak,
+                            confirmedHomeSSIDs: confirmedHomeSSIDs)
         switch action {
         case .none(let reason):
             logLine("noop: \(reason)")
@@ -632,7 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
                     logLine("backoff '\(ln)' ×\(b.fails) → retry in ~\(Int(wait / 60))min")
                 }
                 state.save()
-                consecutiveNetFails = 0; consecutiveWeakReads = 0
+                consecutiveNetFails = 0; consecutiveWeakReads = 0; homeJoinTracker.reset()
                 logLine("SWITCHED → '\(ssid)' :: \(reason)")
             } else {
                 // Couldn't join (e.g. an idle hotspot that can't be woken) → back off this
@@ -905,7 +974,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
         guard let s = bestVisibleHome() else { return }
         work.async {
             // Manual intervention resets backoff and resumes normal auto-switching (home is the preferred state).
-            self.state.backoff.removeAll(); self.consecutiveNetFails = 0; self.state.pinnedSSID = nil; self.state.save()
+            self.state.backoff.removeAll(); self.consecutiveNetFails = 0; self.homeJoinTracker.reset(); self.state.pinnedSSID = nil; self.state.save()
             let r = joinNetwork(s, interface: self.config.interface)
             if r.ok { self.lastCommandedSSID = s }
             logLine("MANUAL → '\(s)' (auto-switch resumed) :: \(r.ok ? "joined" : r.output)")
@@ -916,7 +985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, CWEven
     @objc func switchHotspotNow() {
         guard let s = config.hotspotSSID, !s.isEmpty else { return }
         work.async {
-            self.state.backoff.removeAll(); self.consecutiveNetFails = 0
+            self.state.backoff.removeAll(); self.consecutiveNetFails = 0; self.homeJoinTracker.reset()
             let inScan = uniqueNetworks(self.lastWifi).contains { $0.ssid == s }
             let r = joinNetwork(s, interface: self.config.interface, wakeViaUI: self.config.hotspotWakeViaUI, hotspotInScan: inScan)
             if r.ok {
@@ -993,6 +1062,7 @@ func cmdSelftest() {
     func S(_ cur: NetInfo?, _ scan: [NetInfo]) -> WifiState {
         WifiState(interface: "en0", authStatus: "authorizedAlways", authorized: true, redacted: false, current: cur, scan: scan, scanError: nil)
     }
+    let confirmedHome = Set(["HomeWiFi"])
     let orimarStrong = NetInfo(ssid: "HomeWiFi", bssid: nil, rssi: -45, channel: 149, band: "5GHz")
     let orimarWeak = NetInfo(ssid: "HomeWiFi", bssid: nil, rssi: -80, channel: 149, band: "5GHz")
     let hotspot = NetInfo(ssid: "MyPhone", bssid: nil, rssi: -60, channel: 11, band: "2GHz")
@@ -1000,7 +1070,9 @@ func cmdSelftest() {
     let homeOkCur = NetInfo(ssid: "HomeWiFi", bssid: nil, rssi: -55, channel: 149, band: "5GHz")
     let otherCur = NetInfo(ssid: "CoffeeShop", bssid: nil, rssi: -50, channel: 6, band: "2GHz")
 
-    check("join home from hotspot", decide(config: c, state: S(hotspot, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
+    check("strong home from hotspot waits for confirmation", decide(config: c, state: S(hotspot, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
+          .none("home 'HomeWiFi' in range (-45dBm ≥ -68), waiting for stable signal"))
+    check("confirmed home from hotspot → join", decide(config: c, state: S(hotspot, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false, confirmedHomeSSIDs: confirmedHome),
           .join(ssid: "HomeWiFi", reason: "home 'HomeWiFi' in range (-45dBm ≥ -68)", penalizeLeftNet: false))
     check("on hotspot, weak home → stay", decide(config: c, state: S(hotspot, [orimarWeak]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("on hotspot; home 'HomeWiFi' too weak (-80dBm < -68)"))
@@ -1022,7 +1094,7 @@ func cmdSelftest() {
           .join(ssid: "HomeWiFi", reason: "home 'HomeWiFi' in range (-45dBm ≥ -68)", penalizeLeftNet: false))
     check("on OTHER wifi → leave alone", decide(config: c, state: S(otherCur, [orimarStrong]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("on other network 'CoffeeShop' — leaving it alone"))
-    check("cooldown blocks join", decide(config: c, state: S(hotspot, [orimarStrong]), last: cooling, now: 1030, currentInternetBad: false, homeSignalWeak: false),
+    check("cooldown blocks join", decide(config: c, state: S(hotspot, [orimarStrong]), last: cooling, now: 1030, currentInternetBad: false, homeSignalWeak: false, confirmedHomeSSIDs: confirmedHome),
           .none("would join 'HomeWiFi' but cooling down"))
     check("backed-off home not rejoined", decide(config: c, state: S(hotspot, [orimarStrong]), last: blockedState, now: 5000, currentInternetBad: false, homeSignalWeak: false),
           .none("home 'HomeWiFi' in range but in backoff — staying on hotspot"))
@@ -1032,8 +1104,22 @@ func cmdSelftest() {
           .join(ssid: "HomeWiFi", reason: "home 'HomeWiFi' in range (-45dBm ≥ -68)", penalizeLeftNet: true))
     var multi = c; multi.homeSSIDs = ["HomeWiFi", "Office"]
     let office = NetInfo(ssid: "Office", bssid: nil, rssi: -50, channel: 36, band: "5GHz")
-    check("multiple homes: joins whichever is in range", decide(config: multi, state: S(hotspot, [office]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
+    check("multiple homes: joins whichever is confirmed in range", decide(config: multi, state: S(hotspot, [office]), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false, confirmedHomeSSIDs: Set(["Office"])),
           .join(ssid: "Office", reason: "home 'Office' in range (-50dBm ≥ -68)", penalizeLeftNet: false))
+
+    var tracker = HomeJoinTracker()
+    let h0 = tracker.confirmedHomeSSIDs(config: c, state: S(hotspot, [orimarStrong]), backoff: [:], now: 0, shouldTrack: true)
+    let h60 = tracker.confirmedHomeSSIDs(config: c, state: S(hotspot, [orimarStrong]), backoff: [:], now: 60, shouldTrack: true)
+    let h120 = tracker.confirmedHomeSSIDs(config: c, state: S(hotspot, [orimarStrong]), backoff: [:], now: 120, shouldTrack: true)
+    if h0.isEmpty && h60.isEmpty && h120 == confirmedHome { print("ok   home join requires stable confirmation window") }
+    else { print("FAIL home join confirmation: h0=\(h0) h60=\(h60) h120=\(h120)"); fail += 1 }
+
+    var resetTracker = HomeJoinTracker()
+    _ = resetTracker.confirmedHomeSSIDs(config: c, state: S(hotspot, [orimarStrong]), backoff: [:], now: 0, shouldTrack: true)
+    _ = resetTracker.confirmedHomeSSIDs(config: c, state: S(hotspot, [orimarWeak]), backoff: [:], now: 60, shouldTrack: true)
+    let afterDip = resetTracker.confirmedHomeSSIDs(config: c, state: S(hotspot, [orimarStrong]), backoff: [:], now: 120, shouldTrack: true)
+    if afterDip.isEmpty { print("ok   home join confirmation resets after signal dip") }
+    else { print("FAIL home join confirmation reset: \(afterDip)"); fail += 1 }
 
     var sc = NetworkScores()
     sc.bump(["A"], now: 0); sc.bump(["A"], now: 0)
@@ -1047,8 +1133,8 @@ func cmdSelftest() {
 
     let partial = #"{"homeSSIDs":["X"],"minSignal":-55}"#.data(using: .utf8)!
     let lc = (try? JSONDecoder().decode(Config.self, from: partial)) ?? Config()
-    if lc.homeSSIDs == ["X"] && lc.minSignal == -55 && lc.weakThreshold == 3 && lc.netFailThreshold == 2 { print("ok   config decodes leniently (missing keys default)") }
-    else { print("FAIL lenient config: home=\(lc.homeSSIDs) min=\(lc.minSignal) weak=\(lc.weakThreshold)"); fail += 1 }
+    if lc.homeSSIDs == ["X"] && lc.minSignal == -55 && lc.weakThreshold == 3 && lc.netFailThreshold == 2 && lc.homeJoinConfirmations == 3 && lc.homeJoinWindowSeconds == 120 { print("ok   config decodes leniently (missing keys default)") }
+    else { print("FAIL lenient config: home=\(lc.homeSSIDs) min=\(lc.minSignal) weak=\(lc.weakThreshold) joinConfirmations=\(lc.homeJoinConfirmations) joinWindow=\(lc.homeJoinWindowSeconds)"); fail += 1 }
 
     print(fail == 0 ? "\nALL PASS" : "\n\(fail) FAILED")
     exit(fail == 0 ? 0 : 1)

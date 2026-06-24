@@ -6,8 +6,8 @@ after you get home — and so you bail off a flaky home network back to 5G.
 
 Two behaviors:
 
-1. **Home in range → join it.** When a network you've marked as "home" is visible
-   with strong-enough signal, the Mac leaves the hotspot and joins home.
+1. **Home in range → join it.** When a network you've marked as "home" stays
+   visible with strong-enough signal, the Mac leaves the hotspot and joins home.
 2. **Home gone bad → back to hotspot.** While on home Wi-Fi, if the signal drops
    below your threshold *or the connection stops actually reaching the internet*
    (captive portal / "full bars, no internet"), it switches back to the hotspot.
@@ -90,7 +90,9 @@ It only ever acts in the cases below — **a Wi-Fi network you picked yourself i
 - **On home, gone bad** — signal `< (minSignal − gap)` **or** the internet probe
   fails `netFailThreshold` times in a row → join the hotspot.
 - **Home lost / disconnected** (you left and it dropped) with no home in range → join the hotspot.
-- **On the hotspot (or disconnected) and a home comes into range** `≥ minSignal` → join home.
+- **On the hotspot and a home comes into range** `≥ minSignal` → keep checking it,
+  and join home only after the same SSID stays strong across the confirmation window.
+- **Disconnected and a home is in range** `≥ minSignal` → join home.
 - **On any other network** → do nothing.
 - **You manually switched** (the menu items or the system Wi-Fi menu) → that choice is
   *pinned* and the join-home rule above is suppressed, so you're not yanked back. The pin
@@ -98,6 +100,10 @@ It only ever acts in the cases below — **a Wi-Fi network you picked yourself i
   to have no working internet (then it still rescues you).
 
 - A `cooldownSeconds` window prevents rapid flapping.
+- **Strong-home confirmation:** one good scan is not enough to leave the hotspot.
+  By default, the same home SSID must be seen at least 3 times while staying above
+  the minimum signal for 120 seconds. If it disappears or dips below the threshold,
+  the confirmation starts over.
 - **Connectivity backoff:** a network with no working internet is left and then avoided
   with **exponential backoff** — retry after 10 min, then 20, 40, 80 … capped at 6 h.
   Each failed retry doubles the wait; a passing check clears it. **Manually switching**
@@ -139,7 +145,8 @@ major macOS releases). It is off by default.
 - `switch.log` — decisions and switches.
 
 Defaults: `minSignal -68`, `hysteresisGap 6`, `cooldown 45s`, `poll 30s`,
-`netFailThreshold 2`, `backoffBase 600s`, `backoffMax 6h`.
+`netFailThreshold 2`, `weakThreshold 3`, `homeJoinConfirmations 3`,
+`homeJoinWindowSeconds 120`, `backoffBase 600s`, `backoffMax 6h`.
 
 ## Dev / debugging
 
