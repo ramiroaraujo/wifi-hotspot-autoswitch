@@ -108,6 +108,10 @@ It only ever acts in the cases below — **a Wi-Fi network you picked yourself i
   with **exponential backoff** — retry after 10 min, then 20, 40, 80 … capped at 6 h.
   Each failed retry doubles the wait; a passing check clears it. **Manually switching**
   (the "Switch to … now" items) resets all backoff.
+- **Hotspot rescue retry:** when home Wi-Fi is weak or offline, hotspot failures are
+  retried on a shorter 120-second cadence even if the regular hotspot backoff has grown
+  much longer. This avoids getting stuck on bad home Wi-Fi after a transient Instant
+  Hotspot discovery failure.
 - Internet is verified **only on home Wi-Fi**, every cycle (it's unmetered). The hotspot
   is never probed — it's cellular, and we assume it works once joined, to spare your data.
 - Suppresses App Nap so it keeps monitoring with the lid closed (as long as the
@@ -146,7 +150,8 @@ major macOS releases). It is off by default.
 
 Defaults: `minSignal -68`, `hysteresisGap 6`, `cooldown 45s`, `poll 30s`,
 `netFailThreshold 2`, `weakThreshold 3`, `homeJoinConfirmations 3`,
-`homeJoinWindowSeconds 120`, `backoffBase 600s`, `backoffMax 6h`.
+`homeJoinWindowSeconds 120`, `hotspotRescueRetrySeconds 120`,
+`backoffBase 600s`, `backoffMax 6h`.
 
 ## Dev / debugging
 

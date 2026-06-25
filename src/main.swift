@@ -33,6 +33,7 @@ struct Config: Codable {
     var weakThreshold = 3       // consecutive weak-signal reads before leaving home (anti-flap)
     var homeJoinConfirmations = 3        // sightings required before leaving the hotspot for home
     var homeJoinWindowSeconds: Double = 120  // home must stay strong across this window before auto-join
+    var hotspotRescueRetrySeconds: Double = 120  // while home is unusable, retry hotspot wake on this shorter cadence
     var backoffBaseSeconds: Double = 600      // first retry wait after a dead-internet switch (10 min)
     var backoffMaxSeconds: Double = 6 * 3600  // cap on the exponential backoff (6 h)
     var hotspotWakeViaUI = false              // wake an idle Instant Hotspot by clicking it in the Control Center Wi-Fi menu (needs Accessibility)
@@ -43,7 +44,7 @@ struct Config: Codable {
     enum CodingKeys: String, CodingKey {
         case interface, homeSSIDs, hotspotSSID, minSignal, hysteresisGap, cooldownSeconds, pollSeconds,
              enabled, netFailThreshold, weakThreshold,
-             homeJoinConfirmations, homeJoinWindowSeconds,
+             homeJoinConfirmations, homeJoinWindowSeconds, hotspotRescueRetrySeconds,
              backoffBaseSeconds, backoffMaxSeconds, hotspotWakeViaUI
     }
 
@@ -83,6 +84,7 @@ extension Config {
         weakThreshold = (try? c.decode(Int.self, forKey: .weakThreshold)) ?? weakThreshold
         homeJoinConfirmations = (try? c.decode(Int.self, forKey: .homeJoinConfirmations)) ?? homeJoinConfirmations
         homeJoinWindowSeconds = (try? c.decode(Double.self, forKey: .homeJoinWindowSeconds)) ?? homeJoinWindowSeconds
+        hotspotRescueRetrySeconds = (try? c.decode(Double.self, forKey: .hotspotRescueRetrySeconds)) ?? hotspotRescueRetrySeconds
         backoffBaseSeconds = (try? c.decode(Double.self, forKey: .backoffBaseSeconds)) ?? backoffBaseSeconds
         backoffMaxSeconds = (try? c.decode(Double.self, forKey: .backoffMaxSeconds)) ?? backoffMaxSeconds
         hotspotWakeViaUI = (try? c.decode(Bool.self, forKey: .hotspotWakeViaUI)) ?? hotspotWakeViaUI
@@ -303,6 +305,13 @@ func backoffWait(fails: Int, base: Double, cap: Double) -> Double {
     min(cap, base * pow(2, Double(Swift.max(0, fails - 1))))
 }
 
+func rescueBackoffActive(_ backoff: Backoff?, now: Double, config: Config) -> Bool {
+    guard let b = backoff, b.until > now else { return false }
+    let regularWait = backoffWait(fails: b.fails, base: config.backoffBaseSeconds, cap: config.backoffMaxSeconds)
+    let lastAttempt = b.until - regularWait
+    return now < lastAttempt + config.hotspotRescueRetrySeconds
+}
+
 func decide(config: Config, state: WifiState, last: PersistedState, now: Double, currentInternetBad: Bool, homeSignalWeak: Bool, confirmedHomeSSIDs: Set<String> = []) -> Action {
     let cur = state.current?.ssid
     let rssi = state.current?.rssi ?? 0
@@ -323,7 +332,9 @@ func decide(config: Config, state: WifiState, last: PersistedState, now: Double,
             guard let hs = config.hotspotSSID, !hs.isEmpty else {
                 return .none("home '\(cur ?? "?")' \(homeSignalWeak ? "weak" : "no internet") but no hotspot set")
             }
-            if blocked(hs) { return .none("home '\(cur ?? "?")' \(homeSignalWeak ? "weak" : "no internet"), but hotspot in backoff — staying") }
+            if rescueBackoffActive(last.backoff[hs], now: now, config: config) {
+                return .none("home '\(cur ?? "?")' \(homeSignalWeak ? "weak" : "no internet"), hotspot retry cooling down — staying")
+            }
             if coolingDown { return .none("would leave home but cooling down") }
             let reason = homeSignalWeak ? "home '\(cur ?? "?")' weak (\(rssi)dBm < \(config.rssiDrop))"
                                         : "home '\(cur ?? "?")' has no working internet"
@@ -410,8 +421,21 @@ enum AX {
         var v: AnyObject?
         return AXUIElementCopyAttributeValue(el, a as CFString, &v) == .success ? v : nil
     }
-    static func str(_ el: AXUIElement, _ a: String) -> String { (attr(el, a) as? String) ?? "" }
+    static func str(_ el: AXUIElement, _ a: String) -> String {
+        guard let v = attr(el, a) else { return "" }
+        if let s = v as? String { return s }
+        if let n = v as? NSNumber { return n.stringValue }
+        return ""
+    }
     static func children(_ el: AXUIElement) -> [AXUIElement] { (attr(el, "AXChildren") as? [AXUIElement]) ?? [] }
+    static func parent(_ el: AXUIElement) -> AXUIElement? {
+        guard let p = attr(el, "AXParent") else { return nil }
+        return (p as! AXUIElement)
+    }
+    static func actions(_ el: AXUIElement) -> [String] {
+        var names: CFArray?
+        return AXUIElementCopyActionNames(el, &names) == .success ? (names as? [String] ?? []) : []
+    }
     @discardableResult static func press(_ el: AXUIElement) -> Bool { AXUIElementPerformAction(el, "AXPress" as CFString) == .success }
     /// Dismiss an open Control Center popover by synthesizing an Escape keypress.
     /// AXPress on a row joins the network but, unlike a real mouse click, leaves the
@@ -421,39 +445,111 @@ enum AX {
         CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: true)?.post(tap: .cghidEventTap)   // 53 = Escape
         CGEvent(keyboardEventSource: src, virtualKey: 53, keyDown: false)?.post(tap: .cghidEventTap)
     }
+    static func nearestPressableAncestor(_ el: AXUIElement, maxHops: Int = 6) -> AXUIElement? {
+        var cur: AXUIElement? = el
+        for _ in 0..<maxHops {
+            guard let e = cur else { return nil }
+            if actions(e).contains("AXPress") { return e }
+            cur = parent(e)
+        }
+        return nil
+    }
+    static func textMatches(_ el: AXUIElement, _ text: String) -> Bool {
+        let attrs = ["AXTitle", "AXDescription", "AXValue", "AXLabel", "AXIdentifier"]
+        return attrs.contains { str(el, $0).localizedCaseInsensitiveContains(text) }
+    }
     static func find(_ root: AXUIElement, identifier: String, depth: Int = 0) -> AXUIElement? {
         if depth > 12 { return nil }
         if str(root, "AXIdentifier") == identifier { return root }
         for c in children(root) { if let f = find(c, identifier: identifier, depth: depth + 1) { return f } }
         return nil
     }
+    static func findByText(_ root: AXUIElement, text: String, depth: Int = 0) -> AXUIElement? {
+        if depth > 12 { return nil }
+        if textMatches(root, text) { return nearestPressableAncestor(root) ?? root }
+        for c in children(root) { if let f = findByText(c, text: text, depth: depth + 1) { return f } }
+        return nil
+    }
+    static func summary(_ el: AXUIElement) -> String {
+        let role = str(el, "AXRole")
+        let id = str(el, "AXIdentifier")
+        let title = str(el, "AXTitle")
+        let desc = str(el, "AXDescription")
+        let value = str(el, "AXValue")
+        let actionText = actions(el).contains("AXPress") ? "pressable" : ""
+        let parts = [
+            role.isEmpty ? "" : "role=\(role)",
+            id.isEmpty ? "" : "id=\(id)",
+            title.isEmpty ? "" : "title=\(title)",
+            desc.isEmpty ? "" : "desc=\(desc)",
+            value.isEmpty ? "" : "value=\(value)",
+            actionText
+        ].filter { !$0.isEmpty }
+        return parts.joined(separator: ", ")
+    }
+    static func snapshot(_ roots: [AXUIElement], maxLines: Int = 80) -> String {
+        var lines: [String] = []
+        func walk(_ el: AXUIElement, depth: Int) {
+            guard lines.count < maxLines, depth <= 8 else { return }
+            let s = summary(el)
+            if !s.isEmpty { lines.append("\(String(repeating: ">", count: depth))\(s)") }
+            for c in children(el) { walk(c, depth: depth + 1) }
+        }
+        for root in roots { walk(root, depth: 0) }
+        return lines.isEmpty ? "(no AX rows visible)" : lines.joined(separator: " | ")
+    }
 }
 
 /// Press the hotspot's row in the Control Center Wi-Fi popover (wakes + joins an idle
 /// Personal Hotspot). Returns true if the row was found and pressed. MUST run on the
-/// main thread (it drives UI). The row is identified by AXIdentifier "wifi-network-<SSID>".
-func pressHotspotRowInControlCenter(_ ssid: String) -> Bool {
-    guard AXIsProcessTrusted() else { return false }
-    guard let cc = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.controlcenter" }) else { return false }
+/// main thread (it drives UI). Prefer AXIdentifier "wifi-network-<SSID>", with a
+/// visible-text fallback for macOS releases that expose a different row structure.
+func pressHotspotRowInControlCenter(_ ssid: String) -> (ok: Bool, detail: String) {
+    guard AXIsProcessTrusted() else { return (false, "needs Accessibility permission to wake the hotspot") }
+    guard let cc = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.controlcenter" }) else {
+        return (false, "Control Center is not running")
+    }
     let app = AXUIElementCreateApplication(cc.processIdentifier)
-    guard let embAny = AX.attr(app, "AXExtrasMenuBar") else { return false }
+    guard let embAny = AX.attr(app, "AXExtrasMenuBar") else { return (false, "could not read Control Center menu extras") }
     let emb = embAny as! AXUIElement
-    guard let wifi = AX.children(emb).first(where: { AX.str($0, "AXIdentifier") == "com.apple.menuextra.wifi" }) else { return false }
+    guard let wifi = AX.children(emb).first(where: { AX.str($0, "AXIdentifier") == "com.apple.menuextra.wifi" }) else {
+        return (false, "could not find the Control Center Wi-Fi menu extra")
+    }
     AX.press(wifi)   // open the Wi-Fi popover
     let wantID = "wifi-network-\(ssid)"
     var row: AXUIElement?
+    var matchedBy = ""
+    var windows: [AXUIElement] = []
     for _ in 0..<33 {   // poll up to ~5s for the popover + the (Continuity-advertised) row
-        for w in (AX.attr(app, "AXWindows") as? [AXUIElement]) ?? [] {
-            if let f = AX.find(w, identifier: wantID) { row = f; break }
+        windows = (AX.attr(app, "AXWindows") as? [AXUIElement]) ?? []
+        for w in windows {
+            if let f = AX.find(w, identifier: wantID) {
+                row = f
+                matchedBy = "identifier \(wantID)"
+                break
+            }
+            if let f = AX.findByText(w, text: ssid) {
+                row = f
+                matchedBy = "visible text '\(ssid)'"
+                break
+            }
         }
         if row != nil { break }
         Thread.sleep(forTimeInterval: 0.15)
     }
-    guard let target = row else { AX.press(wifi); return false }   // not advertising → close the popover and bail
-    AX.press(target)   // join the network
+    guard let target = row else {
+        let seen = AX.snapshot(windows)
+        AX.press(wifi)
+        return (false, "hotspot not shown in Wi-Fi menu; visible Wi-Fi UI: \(seen)")
+    }
+    guard AX.press(target) else {
+        let seen = AX.snapshot(windows)
+        AX.sendEscape()
+        return (false, "found hotspot row by \(matchedBy), but AXPress failed; visible Wi-Fi UI: \(seen)")
+    }
     Thread.sleep(forTimeInterval: 0.2)   // let the press register before dismissing the UI
     AX.sendEscape()   // AXPress leaves the popover open — close it so it doesn't linger
-    return true
+    return (true, "pressed hotspot row by \(matchedBy)")
 }
 
 // MARK: - Switching
@@ -492,15 +588,15 @@ func joinNetwork(_ ssid: String, interface: String, wakeViaUI: Bool = false, hot
     // Idle Instant Hotspot: wake + join it through the Control Center Wi-Fi menu.
     if wakeViaUI {
         guard AXIsProcessTrusted() else { return (false, "needs Accessibility permission to wake the hotspot") }
-        var pressed = false
-        if Thread.isMainThread { pressed = pressHotspotRowInControlCenter(ssid) }
-        else { DispatchQueue.main.sync { pressed = pressHotspotRowInControlCenter(ssid) } }
-        if !pressed { return (false, "hotspot not shown in Wi-Fi menu (phone asleep, out of range, or Bluetooth off?)") }
+        var pressResult = (ok: false, detail: "")
+        if Thread.isMainThread { pressResult = pressHotspotRowInControlCenter(ssid) }
+        else { DispatchQueue.main.sync { pressResult = pressHotspotRowInControlCenter(ssid) } }
+        if !pressResult.ok { return (false, pressResult.detail) }
         for _ in 0..<27 {   // ~20s — Bluetooth wake + association can be slow
             if associated() { return (true, "joined via Control Center") }
             Thread.sleep(forTimeInterval: 0.75)
         }
-        return (false, "pressed hotspot in Wi-Fi menu but it didn't associate")
+        return (false, "\(pressResult.detail), but it didn't associate")
     }
 
     return (false, trimmed.isEmpty ? "did not associate to \(ssid)" : trimmed)
@@ -1057,7 +1153,8 @@ func cmdSelftest() {
     let fresh = PersistedState()
     let cooling = PersistedState(lastSwitchEpoch: 1000)
     var blockedState = PersistedState(); blockedState.backoff["HomeWiFi"] = Backoff(fails: 1, until: 9999)
-    var hotspotBlocked = PersistedState(); hotspotBlocked.backoff["MyPhone"] = Backoff(fails: 1, until: 9999)
+    var hotspotCooling = PersistedState(); hotspotCooling.backoff["MyPhone"] = Backoff(fails: 1, until: 5600)
+    var hotspotStaleBackoff = PersistedState(); hotspotStaleBackoff.backoff["MyPhone"] = Backoff(fails: 1, until: 5300)
     var pinnedHotspot = PersistedState(); pinnedHotspot.pinnedSSID = "MyPhone"
     func S(_ cur: NetInfo?, _ scan: [NetInfo]) -> WifiState {
         WifiState(interface: "en0", authStatus: "authorizedAlways", authorized: true, redacted: false, current: cur, scan: scan, scanError: nil)
@@ -1084,8 +1181,10 @@ func cmdSelftest() {
           .none("on home 'HomeWiFi' (-82dBm) — fine"))
     check("home weak (debounced) → hotspot", decide(config: c, state: S(homeWeakCur, []), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: true),
           .join(ssid: "MyPhone", reason: "home 'HomeWiFi' weak (-82dBm < -74)", penalizeLeftNet: false))
-    check("home weak but hotspot in backoff → stay", decide(config: c, state: S(homeWeakCur, []), last: hotspotBlocked, now: 5000, currentInternetBad: false, homeSignalWeak: true),
-          .none("home 'HomeWiFi' weak, but hotspot in backoff — staying"))
+    check("home weak but hotspot retry cooling down → stay", decide(config: c, state: S(homeWeakCur, []), last: hotspotCooling, now: 5000, currentInternetBad: false, homeSignalWeak: true),
+          .none("home 'HomeWiFi' weak, hotspot retry cooling down — staying"))
+    check("home weak ignores stale hotspot backoff → hotspot", decide(config: c, state: S(homeWeakCur, []), last: hotspotStaleBackoff, now: 5000, currentInternetBad: false, homeSignalWeak: true),
+          .join(ssid: "MyPhone", reason: "home 'HomeWiFi' weak (-82dBm < -74)", penalizeLeftNet: false))
     check("good home, dead internet → hotspot+backoff", decide(config: c, state: S(homeOkCur, []), last: fresh, now: 5000, currentInternetBad: true, homeSignalWeak: false),
           .join(ssid: "MyPhone", reason: "home 'HomeWiFi' has no working internet", penalizeLeftNet: true))
     check("LOST HOME (disconnected) → hotspot", decide(config: c, state: S(nil, []), last: fresh, now: 5000, currentInternetBad: false, homeSignalWeak: false),
@@ -1133,8 +1232,8 @@ func cmdSelftest() {
 
     let partial = #"{"homeSSIDs":["X"],"minSignal":-55}"#.data(using: .utf8)!
     let lc = (try? JSONDecoder().decode(Config.self, from: partial)) ?? Config()
-    if lc.homeSSIDs == ["X"] && lc.minSignal == -55 && lc.weakThreshold == 3 && lc.netFailThreshold == 2 && lc.homeJoinConfirmations == 3 && lc.homeJoinWindowSeconds == 120 { print("ok   config decodes leniently (missing keys default)") }
-    else { print("FAIL lenient config: home=\(lc.homeSSIDs) min=\(lc.minSignal) weak=\(lc.weakThreshold) joinConfirmations=\(lc.homeJoinConfirmations) joinWindow=\(lc.homeJoinWindowSeconds)"); fail += 1 }
+    if lc.homeSSIDs == ["X"] && lc.minSignal == -55 && lc.weakThreshold == 3 && lc.netFailThreshold == 2 && lc.homeJoinConfirmations == 3 && lc.homeJoinWindowSeconds == 120 && lc.hotspotRescueRetrySeconds == 120 { print("ok   config decodes leniently (missing keys default)") }
+    else { print("FAIL lenient config: home=\(lc.homeSSIDs) min=\(lc.minSignal) weak=\(lc.weakThreshold) joinConfirmations=\(lc.homeJoinConfirmations) joinWindow=\(lc.homeJoinWindowSeconds) rescueRetry=\(lc.hotspotRescueRetrySeconds)"); fail += 1 }
 
     print(fail == 0 ? "\nALL PASS" : "\n\(fail) FAILED")
     exit(fail == 0 ? 0 : 1)
